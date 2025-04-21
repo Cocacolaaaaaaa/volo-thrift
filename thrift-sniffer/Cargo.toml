@@ -1,0 +1,10 @@
+[package]
+name = "thrift-sniffer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+pnet = { version = "0.34", features = ["std"] }
+anyhow = "1.0"
+hex = "0.4"
