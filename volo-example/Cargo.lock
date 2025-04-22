@@ -2432,8 +2432,10 @@ dependencies = [
 name = "volo_example"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "async-trait",
+ "faststr",
  "lazy_static",
  "pilota",
  "tokio",

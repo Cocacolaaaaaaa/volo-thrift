@@ -8,6 +8,7 @@ use pnet::packet::Packet;
 use anyhow::{Context, Result};
 use std::process;
 
+//命令行参数
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -21,11 +22,13 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // 指定的网卡
     let interface = datalink::interfaces()
         .into_iter()
         .find(|iface| iface.name == args.interface)
         .with_context(|| format!("Interface {} not found", args.interface))?;
 
+    // 创建 data link 通道，拿到接收器 rx
     let (_, mut rx) = match datalink::channel(&interface, Default::default()) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => anyhow::bail!("Unsupported channel type"),
@@ -35,6 +38,8 @@ fn main() -> Result<()> {
 
     println!("Listening on {} for Thrift traffic on port {}", args.interface, args.port);
 
+    
+    // 持续接收并处理每个以太网帧
     loop {
         match rx.next() {
             Ok(packet) => {
@@ -52,6 +57,8 @@ fn main() -> Result<()> {
     }
 }
 
+// 处理 IPv4 数据包
+// 解析 TCP 数据包，检查源或目的端口是否匹配
 fn process_ipv4_packet(ethernet: &EthernetPacket, port: u16) {
     let ipv4 = Ipv4Packet::new(ethernet.payload()).unwrap();
     if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Tcp {
@@ -62,134 +69,225 @@ fn process_ipv4_packet(ethernet: &EthernetPacket, port: u16) {
     }
 }
 
+//Thrift 报文预处理
 fn process_thrift_payload(payload: &[u8]) {
-    if payload.is_empty() {
+    if payload.len() < 16 {
         return;
     }
-    println!("Full Payload (hex bytes):");
-    for (i, byte) in payload.iter().enumerate() {
+
+    println!("Full Payload (hex):");
+    dump_bytes(payload);
+
+    // THeader 协议识别
+    let protocol_id = payload[4];
+    if protocol_id != 0x10 {
+        println!("Not a THeader protocol. Skipping.");
+        return;
+    }
+
+    // 读取 header length
+    let header_len_words = payload[12] as usize;
+    let header_len = header_len_words * 4;
+    let base_header_len = 4 + 8;
+    let header_total_len = base_header_len + header_len;
+
+    if payload.len() <= header_total_len {
+        println!("Invalid payload or THeader too large.");
+        return;
+    }
+
+    // 从 header 末尾处寻找 0x80（BinaryProtocol 版本字节）
+    let mut trans_offset = header_total_len;
+    while trans_offset < payload.len() && payload[trans_offset] != 0x80 {
+        trans_offset += 1;
+    }
+
+    if trans_offset + 4 > payload.len() {
+        println!("Unable to find valid Thrift Binary payload.");
+        return;
+    }
+
+    println!("\nStripped THeader. Parsing BinaryProtocol payload:");
+    dump_bytes(&payload[trans_offset..]);
+
+     // Thrift BinaryProtocol 解析
+    parse_thrift_binary(&payload[trans_offset..]);
+}
+
+fn parse_thrift_binary(data: &[u8]) {
+    let mut offset = 0;
+
+    if data.len() < 4 {
+        println!("Data too short to contain message header.");
+        return;
+    }
+
+    // 读取 message type + version
+    let message_type_and_version = u32::from_be_bytes(data[0..4].try_into().unwrap());
+    offset += 4;
+
+    let version = message_type_and_version & 0xffff0000;
+    if version != 0x80010000 {
+        println!("Unexpected Thrift binary version.");
+        return;
+    }
+
+    let message_type = message_type_and_version & 0x000000ff;
+
+    let message_type_str = match message_type {
+        0x01 => "Call",
+        0x02 => "Reply",
+        0x03 => "Exception",
+        0x04 => "Oneway",
+        _ => "Unknown",
+    };
+
+    println!("Message Type: {} (0x{:02X})", message_type_str, message_type);
+
+    // 读取方法名长度 + 方法名
+    let name_len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    if data.len() < offset + name_len {
+        println!("Payload too short to read method name.");
+        return;
+    }
+
+    let method_name = String::from_utf8_lossy(&data[offset..offset+name_len]);
+    println!("Method Name: {}", method_name);
+    offset += name_len;
+
+    //读取 Sequence ID
+    let seq_id = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap());
+    offset += 4;
+    println!("Sequence ID: {}", seq_id);
+
+    //解析字段列表
+    println!("\n--- Begin Fields ---");
+    while offset + 1 < data.len() {
+        let field_type = data[offset];
+        offset += 1;
+
+        if field_type == 0x00 {
+            println!("Field STOP (0x00)");
+            break;
+        }
+
+        if offset + 2 > data.len() {
+            println!("Unexpected end while reading field ID.");
+            break;
+        }
+
+        let field_id = u16::from_be_bytes(data[offset..offset+2].try_into().unwrap());
+        offset += 2;
+
+        print!("Field ID: {}, Type: 0x{:02X} => ", field_id, field_type);
+        match field_type {
+            0x0A => { // i64
+                if offset + 8 > data.len() {
+                    println!("Not enough data for i64.");
+                    break;
+                }
+                let value = i64::from_be_bytes(data[offset..offset+8].try_into().unwrap());
+                offset += 8;
+                println!("i64 = {}", value);
+            }
+            0x0B => { // string
+                if offset + 4 > data.len() {
+                    println!("Not enough data for string length.");
+                    break;
+                }
+                let len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                offset += 4;
+
+                if offset + len > data.len() {
+                    println!("String truncated.");
+                    break;
+                }
+
+                let s = String::from_utf8_lossy(&data[offset..offset+len]);
+                offset += len;
+                println!("string = \"{}\"", s);
+            }
+            0x02 => { // bool
+                if offset + 1 > data.len() {
+                    println!("Not enough data for bool.");
+                    break;
+                }
+                let value = data[offset] != 0;
+                offset += 1;
+                println!("bool = {}", value);
+            }
+            0x01 => { // double
+                if offset + 8 > data.len() {
+                    println!("Not enough data for double.");
+                    break;
+                }
+                let value = f64::from_be_bytes(data[offset..offset+8].try_into().unwrap());
+                offset += 8;
+                println!("double = {}", value);
+            }
+            0x0C => { // map
+                if offset + 4 > data.len() {
+                    println!("Not enough data for map length.");
+                    break;
+                }
+                let map_len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                offset += 4;
+        
+                if offset + map_len * 2 * 4 > data.len() {
+                    println!("Map data truncated.");
+                    break;
+                }
+        
+                println!("map with {} entries:", map_len);
+                for _ in 0..map_len {
+                    let key_len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                    offset += 4;
+        
+                    if offset + key_len > data.len() {
+                        println!("Key data truncated.");
+                        break;
+                    }
+        
+                    let key = String::from_utf8_lossy(&data[offset..offset+key_len]);
+                    offset += key_len;
+        
+                    let value_len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                    offset += 4;
+        
+                    if offset + value_len > data.len() {
+                        println!("Value data truncated.");
+                        break;
+                    }
+        
+                    let value = String::from_utf8_lossy(&data[offset..offset+value_len]);
+                    offset += value_len;
+        
+                    println!("key: {}, value: {}", key, value);
+                }
+            }
+            0x0F => {
+                println!("Field Type 0x0F: Struct handling not implemented.");
+                offset += 6;
+            }
+            _ => {
+                println!("Unknown or unhandled type: 0x{:02X}", field_type);
+                break;
+            }
+        }
+    }
+    println!("--- End Fields ---\n");
+}
+
+fn dump_bytes(data: &[u8]) {
+    for (i, byte) in data.iter().enumerate() {
         print!("{:02X} ", byte);
         if (i + 1) % 16 == 0 {
             println!();
         }
     }
-    println!();
-
-    let mut cursor = 0;
-
-    // Read message size (4 bytes)
-    let _message_size = read_u32(payload, &mut cursor);
-    println!("Message size: {}", _message_size);
-
-    // Read version (1 byte high nibble = message type, low 3 bytes = version)
-    let version_type = read_u32(payload, &mut cursor);
-    let message_type = (version_type >> 24) & 0xFF;
-    println!("Message type: {} ({})", message_type, message_type_to_str(message_type));
-
-    // Read method name
-    let method_name_len = read_u32(payload, &mut cursor);
-    let method_name = read_string(payload, &mut cursor, method_name_len as usize);
-    println!("Method name: {}", method_name);
-
-    // Read sequence id
-    let seq_id = read_u32(payload, &mut cursor);
-    println!("Seq ID: {}", seq_id);
-
-    // === Start reading arguments ===
-    // Each field starts with: field type (1 byte) + field id (2 bytes)
-
-    loop {
-        if cursor >= payload.len() {
-            println!("End of payload.");
-            break;
-        }
-
-        let field_type = read_u8(payload, &mut cursor);
-        if field_type == 0x00 {
-            println!("TType::STOP (0x00)");
-            break;
-        }
-
-        let field_id = read_u16(payload, &mut cursor);
-        println!("Field ID: {}, Type: {}", field_id, ttype_to_str(field_type));
-
-        match field_type {
-            0x08 => { // i32
-                let value = read_i32(payload, &mut cursor);
-                println!("  -> i32 Value: {}", value);
-            }
-            0x0B => { // string
-                let len = read_u32(payload, &mut cursor);
-                let s = read_string(payload, &mut cursor, len as usize);
-                println!("  -> string: {}", s);
-            }
-            0x0C => { // struct
-                println!("  -> Begin struct");
-                continue;
-            }
-            _ => {
-                println!("  !! Unknown type {}, skipping", field_type);
-                break;
-            }
-        }
-    }
-}
-
-fn read_u8(buf: &[u8], cursor: &mut usize) -> u8 {
-    let val = buf[*cursor];
-    *cursor += 1;
-    val
-}
-
-fn read_u16(buf: &[u8], cursor: &mut usize) -> u16 {
-    let val = u16::from_be_bytes([buf[*cursor], buf[*cursor + 1]]);
-    *cursor += 2;
-    val
-}
-
-fn read_u32(buf: &[u8], cursor: &mut usize) -> u32 {
-    let val = u32::from_be_bytes([buf[*cursor], buf[*cursor + 1], buf[*cursor + 2], buf[*cursor + 3]]);
-    *cursor += 4;
-    val
-}
-
-fn read_i32(buf: &[u8], cursor: &mut usize) -> i32 {
-    let val = i32::from_be_bytes([buf[*cursor], buf[*cursor + 1], buf[*cursor + 2], buf[*cursor + 3]]);
-    *cursor += 4;
-    val
-}
-
-fn read_string(buf: &[u8], cursor: &mut usize, len: usize) -> String {
-    let s = &buf[*cursor..*cursor + len];
-    *cursor += len;
-    String::from_utf8_lossy(s).to_string()
-}
-
-fn message_type_to_str(t: u32) -> &'static str {
-    match t {
-        1 => "CALL",
-        2 => "REPLY",
-        3 => "EXCEPTION",
-        4 => "ONEWAY",
-        _ => "UNKNOWN",
-    }
-}
-
-fn ttype_to_str(t: u8) -> &'static str {
-    match t {
-        0x00 => "STOP",
-        0x01 => "VOID",
-        0x02 => "BOOL",
-        0x03 => "BYTE",
-        0x04 => "DOUBLE",
-        0x06 => "I16",
-        0x08 => "I32",
-        0x0A => "I64",
-        0x0B => "STRING",
-        0x0C => "STRUCT",
-        0x0D => "MAP",
-        0x0E => "SET",
-        0x0F => "LIST",
-        _ => "UNKNOWN",
+    if data.len() % 16 != 0 {
+        println!();
     }
 }

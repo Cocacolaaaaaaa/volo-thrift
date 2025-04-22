@@ -7,7 +7,8 @@ edition.workspace = true
 
 [dependencies]
 volo-gen = { path = "./volo-gen" }
-
+faststr = "0.2"
+ahash = "0.8"
 async-trait = "0.1"
 lazy_static = "1"
 tracing = "0.1"
