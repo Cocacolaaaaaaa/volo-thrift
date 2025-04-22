@@ -164,7 +164,7 @@ fn parse_thrift_binary(data: &[u8]) {
 
     //解析字段列表
     println!("\n--- Begin Fields ---");
-    while offset + 1 < data.len() {
+    while offset + 1 <= data.len() {
         let field_type = data[offset];
         offset += 1;
 
@@ -181,7 +181,7 @@ fn parse_thrift_binary(data: &[u8]) {
         let field_id = u16::from_be_bytes(data[offset..offset+2].try_into().unwrap());
         offset += 2;
 
-        print!("Field ID: {}, Type: 0x{:02X} => ", field_id, field_type);
+        print!("field {} type:", field_id);
         match field_type {
             0x0A => { // i64
                 if offset + 8 > data.len() {
@@ -227,46 +227,10 @@ fn parse_thrift_binary(data: &[u8]) {
                 offset += 8;
                 println!("double = {}", value);
             }
-            0x0C => { // map
-                if offset + 4 > data.len() {
-                    println!("Not enough data for map length.");
-                    break;
-                }
-                let map_len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
-                offset += 4;
-        
-                if offset + map_len * 2 * 4 > data.len() {
-                    println!("Map data truncated.");
-                    break;
-                }
-        
-                println!("map with {} entries:", map_len);
-                for _ in 0..map_len {
-                    let key_len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
-                    offset += 4;
-        
-                    if offset + key_len > data.len() {
-                        println!("Key data truncated.");
-                        break;
-                    }
-        
-                    let key = String::from_utf8_lossy(&data[offset..offset+key_len]);
-                    offset += key_len;
-        
-                    let value_len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
-                    offset += 4;
-        
-                    if offset + value_len > data.len() {
-                        println!("Value data truncated.");
-                        break;
-                    }
-        
-                    let value = String::from_utf8_lossy(&data[offset..offset+value_len]);
-                    offset += value_len;
-        
-                    println!("key: {}, value: {}", key, value);
-                }
-            }
+            0x0C => {
+                println!("Start of struct:");
+                offset = parse_struct(data, offset);
+            }        
             0x0F => {
                 println!("Field Type 0x0F: Struct handling not implemented.");
                 offset += 6;
@@ -290,4 +254,99 @@ fn dump_bytes(data: &[u8]) {
     if data.len() % 16 != 0 {
         println!();
     }
+}
+
+fn parse_struct(data: &[u8], mut offset: usize) -> usize {
+    loop {
+        if offset + 1 > data.len() {
+            break;
+        }
+        let field_type = data[offset];
+        offset += 1;
+
+        if field_type == 0x00 {
+            println!("End of struct (STOP).");
+            break;
+        }
+
+
+
+        if offset + 2 > data.len() {
+            println!("Unexpected end of data while reading field ID.");
+            break;
+        }
+
+        let field_id = u16::from_be_bytes(data[offset..offset+2].try_into().unwrap());
+        offset += 2;
+
+        match field_type {
+            0x0A => {
+                let val = i64::from_be_bytes(data[offset..offset+8].try_into().unwrap());
+                offset += 8;
+                println!("field {} (i64): {}", field_id, val);
+            }
+            0x0B => {
+                let len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                offset += 4;
+                let s = String::from_utf8_lossy(&data[offset..offset+len]);
+                offset += len;
+                println!("field {} (string): {}", field_id, s);
+            }
+            0x0D => { // list
+                let elem_type = data[offset]; // 获取元素类型
+                offset += 2;
+                let list_len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                offset += 4;
+            
+                println!("field {} (list):", field_id);
+            
+                for i in 0..list_len {
+                    if offset + 4 > data.len() {
+                        println!("Not enough data to read element length for index {}", i);
+                        break;
+                    }
+                    
+                    let len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                    offset += 4;
+            
+                    if offset + len > data.len() {
+                        println!("Not enough data to read element data for index {}", i);
+                        break;
+                    }
+            
+                    // 解析列表元素类型
+                    match elem_type {
+                        0x0A => { // 假设是 string 类型
+                            let s = String::from_utf8_lossy(&data[offset..offset+len]);
+                            offset += len;
+                            println!("  [{}] string: {}", i, s);
+                        }
+                        0x0B => { // 假设是 i64 类型
+                            if offset + 8 > data.len() {
+                                println!("Not enough data to read i64 for index {}", i);
+                                break;
+                            }
+                            let val = i64::from_be_bytes(data[offset..offset+8].try_into().unwrap());
+                            offset += 8;
+                            println!("  [{}] i64: {}", i, val);
+                        }
+                        _ => {
+                            println!("  [{}] Unknown element type: 0x{:02X}", i, elem_type);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            0x0C => {
+                println!("field {} Start of struct:", field_id);
+                offset = parse_struct(data, offset);
+            }
+            _ => {
+                println!("Unknown field type: 0x{:02X}", field_type);
+                break;
+            }
+        }
+    }
+    offset
 }
