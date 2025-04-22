@@ -63,101 +63,133 @@ fn process_ipv4_packet(ethernet: &EthernetPacket, port: u16) {
 }
 
 fn process_thrift_payload(payload: &[u8]) {
-    let mut offset = 0;
-    
-    // 检查协议头和版本
-    if payload.len() < 4 {
+    if payload.is_empty() {
         return;
     }
-
-    let protocol_id = payload[0];
-    let protocol_version = payload[1];
-    let is_compact = protocol_id == 0x82 && (protocol_version & 0x1F) == 0x01;
-    let is_binary = protocol_id == 0x80 && protocol_version == 0x01;
-
-    if !is_compact && !is_binary {
-        return;
+    println!("Full Payload (hex bytes):");
+    for (i, byte) in payload.iter().enumerate() {
+        print!("{:02X} ", byte);
+        if (i + 1) % 16 == 0 {
+            println!();
+        }
     }
+    println!();
 
-    // 解析消息类型和版本
-    let message_type = if is_compact {
-        (payload[2] & 0x07) as u8  // Compact协议的消息类型在第三个字节的低3位
-    } else {
-        let version_and_type = i32::from_be_bytes(payload[..4].try_into().unwrap());
-        (version_and_type & 0xFF) as u8
-    };
-    offset += if is_compact { 3 } else { 4 }; // Compact协议头长度不同
+    let mut cursor = 0;
 
-    // 读取方法名（Compact协议使用长度前缀字符串）
-    let (name_len, method_name) = match read_string(payload, &mut offset) {
-        Some(v) => v,
-        None => return,
-    };
+    // Read message size (4 bytes)
+    let _message_size = read_u32(payload, &mut cursor);
+    println!("Message size: {}", _message_size);
 
-    // 读取序列号（Compact协议使用varint编码）
-    let seq_id = if is_compact {
-        let mut value = 0u32;
-        let mut shift = 0;
-        loop {
-            if offset >= payload.len() {
-                return;
+    // Read version (1 byte high nibble = message type, low 3 bytes = version)
+    let version_type = read_u32(payload, &mut cursor);
+    let message_type = (version_type >> 24) & 0xFF;
+    println!("Message type: {} ({})", message_type, message_type_to_str(message_type));
+
+    // Read method name
+    let method_name_len = read_u32(payload, &mut cursor);
+    let method_name = read_string(payload, &mut cursor, method_name_len as usize);
+    println!("Method name: {}", method_name);
+
+    // Read sequence id
+    let seq_id = read_u32(payload, &mut cursor);
+    println!("Seq ID: {}", seq_id);
+
+    // === Start reading arguments ===
+    // Each field starts with: field type (1 byte) + field id (2 bytes)
+
+    loop {
+        if cursor >= payload.len() {
+            println!("End of payload.");
+            break;
+        }
+
+        let field_type = read_u8(payload, &mut cursor);
+        if field_type == 0x00 {
+            println!("TType::STOP (0x00)");
+            break;
+        }
+
+        let field_id = read_u16(payload, &mut cursor);
+        println!("Field ID: {}, Type: {}", field_id, ttype_to_str(field_type));
+
+        match field_type {
+            0x08 => { // i32
+                let value = read_i32(payload, &mut cursor);
+                println!("  -> i32 Value: {}", value);
             }
-            let byte = payload[offset];
-            offset += 1;
-            value |= ((byte as u32 & 0x7F) << shift);
-            if (byte & 0x80) == 0 {
+            0x0B => { // string
+                let len = read_u32(payload, &mut cursor);
+                let s = read_string(payload, &mut cursor, len as usize);
+                println!("  -> string: {}", s);
+            }
+            0x0C => { // struct
+                println!("  -> Begin struct");
+                continue;
+            }
+            _ => {
+                println!("  !! Unknown type {}, skipping", field_type);
                 break;
             }
-            shift += 7;
-            if shift > 28 {
-                return; // 防止溢出
-            }
         }
-        (value >> 1) as u32 ^ (!(value & 1) + 1) // ZigZag解码
-    } else {
-        if payload.len() < offset + 4 {
-            return;
-        }
-        let id = u32::from_be_bytes(payload[offset..offset+4].try_into().unwrap());
-        offset += 4;
-        id
-    };
-
-    // 剩余部分为消息体
-    let body = &payload[offset..];
-
-    println!("Thrift Message [{}]:", if is_compact { "Compact" } else { "Binary" });
-    println!("  Method: {}", method_name);
-    println!("  Type: {} ({})", message_type, message_type_str(message_type));
-    println!("  Seq ID: {}", seq_id);
-    println!("  Body length: {} bytes", body.len());
-    println!("  Body (hex): {}", hex::encode(body));
-    println!();
+    }
 }
 
-fn read_string(payload: &[u8], offset: &mut usize) -> Option<(usize, String)> {
-    if payload.len() < *offset + 4 {
-        return None;
-    }
-    
-    let len = u32::from_be_bytes(payload[*offset..*offset+4].try_into().unwrap()) as usize;
-    *offset += 4;
-    
-    if payload.len() < *offset + len {
-        return None;
-    }
-    
-    let s = String::from_utf8_lossy(&payload[*offset..*offset+len]).to_string();
-    *offset += len;
-    Some((len, s))
+fn read_u8(buf: &[u8], cursor: &mut usize) -> u8 {
+    let val = buf[*cursor];
+    *cursor += 1;
+    val
 }
 
-fn message_type_str(t: u8) -> &'static str {
+fn read_u16(buf: &[u8], cursor: &mut usize) -> u16 {
+    let val = u16::from_be_bytes([buf[*cursor], buf[*cursor + 1]]);
+    *cursor += 2;
+    val
+}
+
+fn read_u32(buf: &[u8], cursor: &mut usize) -> u32 {
+    let val = u32::from_be_bytes([buf[*cursor], buf[*cursor + 1], buf[*cursor + 2], buf[*cursor + 3]]);
+    *cursor += 4;
+    val
+}
+
+fn read_i32(buf: &[u8], cursor: &mut usize) -> i32 {
+    let val = i32::from_be_bytes([buf[*cursor], buf[*cursor + 1], buf[*cursor + 2], buf[*cursor + 3]]);
+    *cursor += 4;
+    val
+}
+
+fn read_string(buf: &[u8], cursor: &mut usize, len: usize) -> String {
+    let s = &buf[*cursor..*cursor + len];
+    *cursor += len;
+    String::from_utf8_lossy(s).to_string()
+}
+
+fn message_type_to_str(t: u32) -> &'static str {
     match t {
-        1 => "Call",
-        2 => "Reply",
-        3 => "Exception",
-        4 => "Oneway",
-        _ => "Unknown",
+        1 => "CALL",
+        2 => "REPLY",
+        3 => "EXCEPTION",
+        4 => "ONEWAY",
+        _ => "UNKNOWN",
+    }
+}
+
+fn ttype_to_str(t: u8) -> &'static str {
+    match t {
+        0x00 => "STOP",
+        0x01 => "VOID",
+        0x02 => "BOOL",
+        0x03 => "BYTE",
+        0x04 => "DOUBLE",
+        0x06 => "I16",
+        0x08 => "I32",
+        0x0A => "I64",
+        0x0B => "STRING",
+        0x0C => "STRUCT",
+        0x0D => "MAP",
+        0x0E => "SET",
+        0x0F => "LIST",
+        _ => "UNKNOWN",
     }
 }
