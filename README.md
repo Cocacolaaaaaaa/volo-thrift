@@ -11,8 +11,3 @@ cargo run -- --interface {} --port {}
 
 cd volo-example 
 cargo run --bin client
-
-# failed
-抓不到包orz 
-我用的wsl，网络通信可能有问题，也有可能是逻辑有问题
-事情多，也没时间去服务器测试了:<
